@@ -57,9 +57,10 @@ that camera backend is Linux-specific. To use it on a Windows computer, run it
 inside WSL2, attach the webcam to WSL, and use WSLg for the preview window.
 
 Mouse mode in WSL starts `windows_mouse_bridge.ps1` to move and click the
-Windows desktop cursor. It requires WSL Windows interop and `powershell.exe`
-on the WSL `PATH`. On a regular Linux desktop, mouse mode uses PyAutoGUI
-instead; install it with `python3 -m pip install pyautogui`.
+Windows desktop cursor and detect Ctrl presses. It requires WSL Windows
+interop and `powershell.exe` on the WSL `PATH`. On a regular Linux desktop,
+mouse mode uses PyAutoGUI for cursor control and X11 to detect Ctrl; install
+PyAutoGUI with `python3 -m pip install pyautogui`.
 
 ## Run
 
@@ -77,10 +78,11 @@ Choose a mode in the terminal:
 - `r`: recognize gestures from saved samples.
 - `c`: correction mode. Press the correct gesture key to add a labeled sample.
 - `m`: mouse mode. A recognized right-hand index-point moves the pointer; a
-  left-hand palm-to-fist transition clicks once. In WSL, this mode starts
-  `windows_mouse_bridge.ps1` to control the Windows cursor. Keep the gesture
-  stable briefly to avoid accidental clicks; press `q` or Esc in the preview
-  to stop.
+  left-hand palm-to-fist transition or pressing Ctrl while the right
+  index-point is detected clicks once. Pointer movement is lightly smoothed.
+  In WSL, this mode starts `windows_mouse_bridge.ps1` to control the Windows
+  cursor. Keep the gesture stable briefly to avoid accidental clicks; press
+  `q` or Esc in the preview to stop.
 
 Press `q` or Esc in the camera window to exit. Samples are stored in
 `gesture_samples.csv` beside the script. The dataset may be deleted in case you

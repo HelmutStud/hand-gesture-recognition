@@ -10,6 +10,9 @@ public static class GestureMouseNative {
     public static extern int GetSystemMetrics(int index);
 
     [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
     public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, System.UIntPtr extraInfo);
 }
 "@
@@ -40,6 +43,11 @@ while ($true) {
         "C" {
             [GestureMouseNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
             [GestureMouseNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        }
+        "K" {
+            $ctrlPressed = ([GestureMouseNative]::GetAsyncKeyState(0x11) -band 0x8000) -ne 0
+            [Console]::Out.WriteLine("CTRL|{0}" -f [int]$ctrlPressed)
+            [Console]::Out.Flush()
         }
         "Q" {
             break

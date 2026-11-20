@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import mediapipe as mp
 
 MOUSE_GESTURE_STABLE_SECONDS = 0.15
 MOUSE_CLICK_COOLDOWN_SECONDS = 0.8
+MOUSE_SMOOTHING_ALPHA = 0.45
 
 MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
 WINDOWS_MOUSE_BRIDGE_PATH = Path(__file__).with_name("windows_mouse_bridge.ps1")
@@ -46,6 +48,7 @@ class ClickGestureState:
     stable_gesture: str | None = None
     armed: bool = False
     last_click: float = -math.inf
+    ctrl_was_pressed: bool = False
 
 
 @dataclass
@@ -53,6 +56,51 @@ class MouseController:
     backend: Any
     screen_width: int
     screen_height: int
+    ctrl_monitor: Any
+    smoothed_x: float | None = None
+    smoothed_y: float | None = None
+
+    def is_ctrl_pressed(self) -> bool:
+        return self.ctrl_monitor.is_pressed()
+
+    def close(self) -> None:
+        if hasattr(self.backend, "close"):
+            self.backend.close()
+        if self.ctrl_monitor is not self.backend:
+            self.ctrl_monitor.close()
+
+
+class CtrlKeyMonitor:
+    def __init__(self) -> None:
+        try:
+            from Xlib import XK, display
+        except ImportError as error:
+            raise RuntimeError(
+                "Ctrl-click on Linux needs python-xlib. Install PyAutoGUI with: "
+                "python3 -m pip install pyautogui"
+            ) from error
+
+        self._display = display.Display()
+        self._ctrl_keycodes = {
+            keycode
+            for key in (
+                "Control_L",
+                "Control_R",
+            )
+            if (keycode := self._display.keysym_to_keycode(
+                XK.string_to_keysym(key)
+            ))
+        }
+
+    def is_pressed(self) -> bool:
+        keymap = self._display.query_keymap()
+        return any(
+            keymap[keycode // 8] & (1 << (keycode % 8))
+            for keycode in self._ctrl_keycodes
+        )
+
+    def close(self) -> None:
+        self._display.close()
 
 
 class WindowsMouseBridge:
@@ -97,6 +145,11 @@ class WindowsMouseBridge:
             errors="replace",
             bufsize=1,
         )
+        self._command_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._stop_ctrl_polling = threading.Event()
+        self._ctrl_pressed = False
+        self._ctrl_error: str | None = None
         if self.process.stdout is None:
             raise RuntimeError("Could not read the Windows mouse bridge response.")
         ready = self.process.stdout.readline().strip().split("|")
@@ -119,6 +172,39 @@ class WindowsMouseBridge:
             raise RuntimeError(
                 "Windows mouse bridge returned non-positive screen dimensions."
             )
+        self._ctrl_thread = threading.Thread(
+            target=self._poll_ctrl_key,
+            name="windows-ctrl-key-poll",
+            daemon=True,
+        )
+        self._ctrl_thread.start()
+
+    def _poll_ctrl_key(self) -> None:
+        while not self._stop_ctrl_polling.wait(0.03):
+            try:
+                self._send("K")
+                if self.process.stdout is None:
+                    raise RuntimeError("Windows mouse bridge output is unavailable.")
+                response = self.process.stdout.readline().strip()
+                if response not in ("CTRL|0", "CTRL|1"):
+                    raise RuntimeError(
+                        "Windows mouse bridge returned an invalid Ctrl-key state: "
+                        f"{response!r}"
+                    )
+                with self._state_lock:
+                    self._ctrl_pressed = response == "CTRL|1"
+            except (OSError, RuntimeError) as error:
+                with self._state_lock:
+                    self._ctrl_error = str(error)
+                return
+
+    def is_pressed(self) -> bool:
+        with self._state_lock:
+            if self._ctrl_error is not None:
+                raise RuntimeError(
+                    f"Could not read Ctrl key state: {self._ctrl_error}"
+                )
+            return self._ctrl_pressed
 
     def _send(self, command: str) -> None:
         if self.process.poll() is not None:
@@ -129,8 +215,9 @@ class WindowsMouseBridge:
         if self.process.stdin is None:
             raise RuntimeError("Windows mouse bridge input is unavailable.")
         try:
-            self.process.stdin.write(command + "\n")
-            self.process.stdin.flush()
+            with self._command_lock:
+                self.process.stdin.write(command + "\n")
+                self.process.stdin.flush()
         except OSError as error:
             raise RuntimeError(
                 "Windows mouse bridge stopped accepting commands."
@@ -143,12 +230,17 @@ class WindowsMouseBridge:
         self._send("C")
 
     def close(self) -> None:
+        if hasattr(self, "_stop_ctrl_polling"):
+            self._stop_ctrl_polling.set()
+        if hasattr(self, "_ctrl_thread"):
+            self._ctrl_thread.join(timeout=1)
         if self.process.poll() is None:
             try:
-                if self.process.stdin is not None:
-                    self.process.stdin.write("Q\n")
-                    self.process.stdin.flush()
-                    self.process.stdin.close()
+                with self._command_lock:
+                    if self.process.stdin is not None:
+                        self.process.stdin.write("Q\n")
+                        self.process.stdin.flush()
+                        self.process.stdin.close()
                 self.process.wait(timeout=2)
             except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
                 self.process.terminate()
@@ -317,6 +409,7 @@ def create_mouse_controller() -> MouseController:
             bridge,
             bridge.screen_width,
             bridge.screen_height,
+            bridge,
         )
 
     auth_path = os.environ.get("XAUTHORITY")
@@ -338,19 +431,28 @@ def create_mouse_controller() -> MouseController:
     pyautogui.PAUSE = 0
     pyautogui.FAILSAFE = True
     screen_width, screen_height = pyautogui.size()
-    return MouseController(pyautogui, screen_width, screen_height)
+    ctrl_monitor = CtrlKeyMonitor()
+    return MouseController(pyautogui, screen_width, screen_height, ctrl_monitor)
 
 
 def move_mouse_to_index(mouse: MouseController, landmarks: Sequence[Any]) -> None:
     index_tip = landmarks[8]
-    screen_x = max(
+    target_x = max(
         1,
         round(max(0.0, min(1.0, index_tip.x)) * (mouse.screen_width - 1)),
     )
-    screen_y = max(
+    target_y = max(
         1,
         round(max(0.0, min(1.0, index_tip.y)) * (mouse.screen_height - 1)),
     )
+    if mouse.smoothed_x is None or mouse.smoothed_y is None:
+        mouse.smoothed_x = float(target_x)
+        mouse.smoothed_y = float(target_y)
+    else:
+        mouse.smoothed_x += MOUSE_SMOOTHING_ALPHA * (target_x - mouse.smoothed_x)
+        mouse.smoothed_y += MOUSE_SMOOTHING_ALPHA * (target_y - mouse.smoothed_y)
+    screen_x = round(mouse.smoothed_x)
+    screen_y = round(mouse.smoothed_y)
     mouse.backend.moveTo(screen_x, screen_y, duration=0)
 
 
@@ -385,6 +487,24 @@ def update_click_gesture(
         if now - state.last_click >= MOUSE_CLICK_COOLDOWN_SECONDS:
             mouse.backend.click()
             state.last_click = now
+
+
+def update_ctrl_click(
+    mouse: MouseController,
+    state: ClickGestureState,
+    pressed: bool,
+    index_in_frame: bool,
+    now: float,
+) -> None:
+    just_pressed = pressed and not state.ctrl_was_pressed
+    state.ctrl_was_pressed = pressed
+    if (
+        just_pressed
+        and index_in_frame
+        and now - state.last_click >= MOUSE_CLICK_COOLDOWN_SECONDS
+    ):
+        mouse.backend.click()
+        state.last_click = now
 
 
 def rewrite_samples(features: Sequence[FeatureVector], labels: Sequence[str]) -> None:
@@ -507,8 +627,8 @@ def run_camera(
     camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if not camera.isOpened():
         camera.release()
-        if mouse is not None and hasattr(mouse.backend, "close"):
-            mouse.backend.close()
+        if mouse is not None:
+            mouse.close()
         raise RuntimeError("Could not open the camera. Check that it is connected.")
 
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -521,7 +641,7 @@ def run_camera(
             last_capture_time = 0.0
             if mode == "m":
                 status = (
-                    "Mouse: R index moves; L palm-to-fist clicks; "
+                    "Mouse: R index moves; Ctrl+R-index or L palm-to-fist clicks; "
                     "press q or Esc to stop"
                 )
             elif mode == "c":
@@ -596,11 +716,19 @@ def run_camera(
                 if mouse is not None:
                     if right_index_landmarks is not None:
                         move_mouse_to_index(mouse, right_index_landmarks)
+                    now = time.monotonic()
+                    update_ctrl_click(
+                        mouse,
+                        click_state,
+                        mouse.is_ctrl_pressed(),
+                        right_index_landmarks is not None,
+                        now,
+                    )
                     update_click_gesture(
                         mouse,
                         click_state,
                         left_gesture,
-                        time.monotonic(),
+                        now,
                     )
 
                 if mode in ("t", "c"):
@@ -660,8 +788,8 @@ def run_camera(
     finally:
         camera.release()
         cv2.destroyAllWindows()
-        if mouse is not None and hasattr(mouse.backend, "close"):
-            mouse.backend.close()
+        if mouse is not None:
+            mouse.close()
 
 
 def main() -> None:
@@ -694,7 +822,8 @@ def main() -> None:
     elif mode == "m":
         print(
             "Mouse mode: right index-point moves the pointer; "
-            "left palm-to-fist clicks. Press q or Esc to stop."
+            "Ctrl+right-index or left palm-to-fist clicks. "
+            "Press q or Esc to stop."
         )
 
     run_camera(mode, features, labels, classifier)

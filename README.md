@@ -83,9 +83,8 @@ Choose a mode in the terminal:
   to stop.
 
 Press `q` or Esc in the camera window to exit. Samples are stored in
-`gesture_samples.csv` beside the script. The dataset, migration backup, model,
-and legacy script backup are ignored by Git, so personal training data and
-downloaded model files are not pushed by default.
+`gesture_samples.csv` beside the script. The dataset may be deleted in case you
+with to re-train your own set.
 
 ## Notes
 

@@ -7,38 +7,113 @@ or OpenCV API reference.
 
 ## 1. System overview
 
-The application uses a single camera loop for training, recognition,
-correction, and mouse control:
+The program has two distinct routes: a webcam route (`t`, `r`, `c`, `m`) and a
+one-image route (`s`). The webcam route shares one frame-processing loop; the
+selected mode determines what happens after a hand is detected.
 
 ```text
-Camera frame
-    |
-    v
-Mirror frame -> MediaPipe Hand Landmarker -> handedness + 21 landmarks
-                                              |
-                                              v
-                              wrist-relative feature extraction
-                              + rotation normalization
-                                              |
-                                  k-nearest-neighbors
-                                              |
-                 +----------------------------+-----------------------+
-                 |                            |                       |
-           draw labels                 capture/save sample       mouse mode
-                                                                  |
-                                             index fingertip -> smoothed cursor
-                                             Ctrl press / palm-to-fist -> click
-
-Static image
-    |
-    v
-MediaPipe IMAGE mode -> hand landmarks -> skeleton overlay -> output image
+                         START
+                           |
+                           v
+                  Ask for a mode (t/r/c/m/s)
+                     /                 \
+             webcam mode (t/r/c/m)    static image (s)
+                   |                       |
+        Read gesture_samples.csv            Ask for image paths
+        Fit KNN if samples exist            Read one image
+        (skip prediction in t mode)          Detect landmarks (IMAGE mode)
+                   |                       Draw skeletons and save copy
+        Open camera + VIDEO landmarker      (no classifier or CSV needed)
+                   |
+         Repeat once per camera frame
+                   |
+        Read frame -> mirror it -> detect up to two hands
+                   |
+        Draw each detected hand's skeleton
+                   |
+       +-----------+-----------------------------+
+       |                                         |
+  t: training                         r/c/m: classify each hand
+  wait for a label key                         |
+  extract features                      Show label or "unknown"
+  append labeled row                            |
+  refit classifier                     +--------+---------+
+                                       |                  |
+                                  r: display        c: wait for
+                                     only            correction key,
+                                                     save sample,
+                                                     refit KNN
+                                                          |
+                                                  m: use right-hand
+                                                  index-point to move;
+                                                  Ctrl or left-hand
+                                                  palm-to-fist to click
+       |
+  Display preview and handle keys
+       |
+  q/Esc or error -> release camera, windows, and mouse resources
 ```
 
-In mouse mode under WSL, gesture recognition stays in Linux. A long-running
-PowerShell child process receives simple cursor commands and forwards them to
-the Windows desktop using Windows APIs. On a regular Linux desktop, PyAutoGUI
-controls the pointer and X11 is queried for the Ctrl key state.
+### What the program learns (and what it does not)
+
+MediaPipe is the hand detector: it finds hands and returns 21 landmark
+positions for each. It is not trained by this program. The program turns those
+positions into a 63-number feature vector describing the hand shape, then uses
+a small k-nearest-neighbors (KNN) classifier to compare that vector with
+examples in `gesture_samples.csv`.
+
+Consequently, `t` does not train a new neural network. It collects examples:
+you show a gesture, press its label key, and the normalized features and label
+are appended to the CSV. In `r`, `c`, and `m`, startup loads those examples and
+fits KNN in memory. New examples added in `c` are appended and immediately
+included in a new in-memory fit. The CSV is the persistent training data; the
+fitted KNN is recreated each time the program starts.
+
+### Webcam path, in sequence
+
+1. `main` asks for a mode. For `t`, `r`, `c`, or `m`, it loads and validates
+   the CSV. In `r`, `c`, and `m`, it fits KNN if there are samples; without
+   samples, detected hands can still be shown but their gesture is `unknown`.
+   Training mode loads existing samples so new examples can be added, but it
+   does not need to predict gestures.
+2. `run_camera` starts mouse-control support only for `m`, opens camera device
+   0 through V4L2, and creates a MediaPipe landmarker in video mode.
+3. For each frame, OpenCV reads and mirrors the image. A strictly increasing
+   timestamp accompanies the frame because the MediaPipe video API expects
+   ordered video frames. The frame is converted from OpenCV's BGR format to
+   RGB, and MediaPipe returns landmarks (and handedness for the webcam path).
+4. The skeleton is drawn for each detected hand. In `r`, `c`, and `m`, each
+   hand's landmarks are normalized into a feature vector and passed to KNN.
+   The resulting gesture label, vote agreement, or `unknown` is drawn beside
+   the hand. In `t`, prediction is skipped.
+5. Mode-specific work happens next: `t` saves a sample when a gesture key is
+   pressed; `c` saves the hand with the label key the user presses and refits
+   KNN; `m` moves/clicks the pointer when its gesture/key conditions are met;
+   `r` only displays predictions.
+6. OpenCV displays the preview and reads the keypress. `q` or Escape exits the
+   loop. Cleanup releases the camera, closes the preview windows, and closes
+   mouse/key-monitor resources when applicable.
+
+The order matters: a correction key labels the currently detected first hand;
+it does not automatically infer the correct label. Mouse mode likewise uses
+the classifier's output, not raw hand shape alone, to decide whether an
+index-point should move the pointer.
+
+### Static-image path
+
+Mode `s` takes a separate path from `main`: it prompts for an input image and
+optional output path, reads the image, and asks MediaPipe's IMAGE-mode
+landmarker for hand landmarks once. It draws the detected skeletons and saves
+the result (or an unchanged copy when no hands are detected). This path does
+not open the camera, load the CSV, extract gesture features, or run KNN.
+
+### Mouse-control boundary
+
+In mouse mode under WSL, hand detection and gesture recognition stay in Linux.
+A long-running PowerShell child process receives simple cursor commands and
+forwards them to the Windows desktop using Windows APIs; it also reports Ctrl
+key state. On a regular Linux desktop, PyAutoGUI controls the pointer and X11
+is queried for Ctrl state.
 
 ## 2. Imports, constants, and shared state
 

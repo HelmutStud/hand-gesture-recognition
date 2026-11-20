@@ -5,6 +5,9 @@ MediaPipe Tasks. It can collect labeled hand-landmark samples, recognize
 gestures with a k-nearest-neighbors classifier, and add corrections to the
 training data.
 
+For a detailed walkthrough of the source code, see the
+[Technical Guide](./TECHNICAL_GUIDE.md).
+
 ## Requirements
 
 - Python 3.10 or later
@@ -83,6 +86,12 @@ Choose a mode in the terminal:
   In WSL, this mode starts `windows_mouse_bridge.ps1` to control the Windows
   cursor. Keep the gesture stable briefly to avoid accidental clicks; press
   `q` or Esc in the preview to stop.
+- `s`: static-image hand detection. Enter an image path and an optional output
+  path. The default output is `<image-name>_hands.<extension>` beside the
+  input. Detected hand skeletons are drawn and saved without gesture
+  classification or camera access. From WSL, you can enter either a Linux path
+  such as `/mnt/d/Images/1.jpg` or a Windows path such as
+  `D:\Images\1.jpg`; Windows paths are converted automatically.
 
 Press `q` or Esc in the camera window to exit. Samples are stored in
 `gesture_samples.csv` beside the script. The dataset may be deleted in case you

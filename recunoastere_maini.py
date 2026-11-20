@@ -319,7 +319,9 @@ class GestureClassifier:
         return best_label, neighbor_agreement, mean_neighbor_distance
 
 
-def create_hand_landmarker():
+def create_hand_landmarker(
+    running_mode: Any = mp.tasks.vision.RunningMode.VIDEO,
+):
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
             f"Hand landmark model not found: {MODEL_PATH}\n"
@@ -328,7 +330,7 @@ def create_hand_landmarker():
 
     options = mp.tasks.vision.HandLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        running_mode=running_mode,
         num_hands=2,
         min_hand_detection_confidence=0.6,
         min_tracking_confidence=0.5,
@@ -359,6 +361,19 @@ def detect_hands(
                 )
         detected_hands.append((handedness, landmarks))
     return detected_hands
+
+
+def detect_hands_in_image(
+    frame: Any,
+    hands: Any,
+) -> list[tuple[str, list[Any]]]:
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb_frame,
+    )
+    results = hands.detect(mp_image)
+    return [("?", landmarks) for landmarks in results.hand_landmarks]
 
 
 def extract_features(landmarks: Sequence[Any]) -> FeatureVector:
@@ -609,11 +624,81 @@ def draw_hand_landmarks(
 def select_mode() -> str:
     while True:
         choice = input(
-            "Choose mode: [t]rain, [r]ecognize, [c]orrect, or [m]ouse: "
+            "Choose mode: [t]rain, [r]ecognize, [c]orrect, [m]ouse, "
+            "or static image ([s]): "
         ).strip().lower()
-        if choice in ("t", "r", "c", "m"):
+        if choice in ("t", "r", "c", "m", "s"):
             return choice
-        print("Please enter 't', 'r', 'c', or 'm'.")
+        print("Please enter 't', 'r', 'c', 'm', or 's'.")
+
+
+def resolve_image_path(path_text: str) -> Path:
+    path = Path(path_text).expanduser()
+    if os.environ.get("WSL_INTEROP") and len(path_text) >= 3:
+        is_windows_drive_path = (
+            path_text[0].isalpha()
+            and path_text[1] == ":"
+            and path_text[2] in ("\\", "/")
+        )
+        if is_windows_drive_path:
+            converted = subprocess.run(
+                ["wslpath", "-u", path_text],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if not converted:
+                raise RuntimeError(
+                    f"Could not convert Windows path to WSL path: {path_text}"
+                )
+            path = Path(converted)
+    return path
+
+
+def run_static_image_mode() -> None:
+    image_path_text = input("Image file path: ").strip().strip("\"'")
+    if not image_path_text:
+        raise ValueError("An input image path is required.")
+    image_path = resolve_image_path(image_path_text)
+
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not open image file: {image_path}. "
+            "Check that the path is correct and the image format is supported."
+        )
+
+    default_output_path = image_path.with_name(
+        f"{image_path.stem}_hands{image_path.suffix or '.jpg'}"
+    )
+    output_path_text = input(
+        f"Output image path [{default_output_path}]: "
+    ).strip().strip("\"'")
+    output_path = (
+        resolve_image_path(output_path_text)
+        if output_path_text
+        else default_output_path
+    )
+    if output_path.resolve() == image_path.resolve():
+        raise ValueError("The output path must not overwrite the input image.")
+
+    with create_hand_landmarker(mp.tasks.vision.RunningMode.IMAGE) as hands:
+        detected_hands = detect_hands_in_image(image, hands)
+    draw_hand_landmarks(image, detected_hands)
+
+    if not cv2.imwrite(str(output_path), image):
+        raise RuntimeError(f"Could not save the annotated image to: {output_path}")
+    if detected_hands:
+        print(
+            f"Saved image with {len(detected_hands)} detected hand(s) to: "
+            f"{output_path}"
+        )
+    else:
+        print(
+            "No hands were detected; saved an unchanged copy to: "
+            f"{output_path}. The hand landmark model is intended for human "
+            "hands and may not detect robotic or highly occluded hands."
+        )
 
 
 def run_camera(
@@ -794,6 +879,10 @@ def run_camera(
 
 def main() -> None:
     mode = select_mode()
+    if mode == "s":
+        run_static_image_mode()
+        return
+
     features, labels = load_samples()
     classifier = GestureClassifier()
 

@@ -28,6 +28,11 @@ Mirror frame -> MediaPipe Hand Landmarker -> handedness + 21 landmarks
                                                                   |
                                              index fingertip -> smoothed cursor
                                              Ctrl press / palm-to-fist -> click
+
+Static image
+    |
+    v
+MediaPipe IMAGE mode -> hand landmarks -> skeleton overlay -> output image
 ```
 
 In mouse mode under WSL, gesture recognition stays in Linux. A long-running
@@ -82,6 +87,13 @@ a short handedness label.
 The camera image is mirrored before detection in `run_camera`. The returned
 MediaPipe left/right label is therefore swapped here so the displayed labels
 and mouse-mode left/right behavior match the mirrored preview.
+
+### `detect_hands_in_image`
+
+This helper converts a still BGR image to an RGB MediaPipe image and calls the
+landmarker's synchronous `detect` method. It returns the landmark lists in the
+same container shape used by the shared skeleton-drawing helper. It does not
+extract gesture features or run the classifier.
 
 ### `extract_features`
 
@@ -227,9 +239,28 @@ at 640x480, and owns the frame loop. Each iteration:
 Press `q` or Escape in the preview to exit. The `finally` block releases the
 camera, closes OpenCV windows, and closes mouse/key-monitor resources.
 
+### `run_static_image_mode`
+
+Static-image mode prompts for an input path and an optional output path. When
+the output is left blank, it writes a sibling file named
+`<input-stem>_hands<input-extension>` (or `.jpg` if the input has no extension).
+`resolve_image_path` accepts Linux paths and, under WSL, Windows drive paths;
+it uses `wslpath -u` to convert a Windows path such as `D:\Images\1.jpg` into
+its mounted Linux path before OpenCV opens or writes the file.
+It opens the image with OpenCV, creates a MediaPipe Hand Landmarker in
+`RunningMode.IMAGE`, detects up to two hands, draws the detected skeletons,
+and saves the annotated copy. It rejects a missing/unreadable input and
+prevents the output path from replacing the source image.
+If MediaPipe detects no hands, the output is an unchanged copy and the console
+reports that no skeletons were detected. The bundled model is designed for
+human hands and does not provide general robotic-hand detection.
+
+This path deliberately skips handedness labels, gesture feature extraction,
+classification, the webcam loop, and training-dataset loading.
+
 ### `select_mode` and `main`
 
-`select_mode` prompts for one of four modes:
+`select_mode` prompts for one of five modes:
 
 | Mode | Behavior |
 | --- | --- |
@@ -237,11 +268,13 @@ camera, closes OpenCV windows, and closes mouse/key-monitor resources.
 | `r` | Recognition: classify and display each detected hand. |
 | `c` | Correction: classify hands and append a sample with the corrected label. |
 | `m` | Mouse: recognized right index-point moves the pointer; Ctrl plus that hand clicks; left palm-to-fist clicks. |
+| `s` | Static image: detect hands in one image and save a skeleton-overlay copy without gesture recognition. |
 
-`main` selects the mode, loads saved samples once, fits the classifier when
-needed, prints mode-specific instructions, and starts `run_camera`. In
-training/correction modes it prints updated sample totals after the camera
-loop exits.
+`main` routes static-image mode directly to `run_static_image_mode`, so it
+does not load the CSV dataset or open a camera. The other modes load saved
+samples once, fit the classifier when needed, print mode-specific instructions,
+and start `run_camera`. In training/correction modes it prints updated sample
+totals after the camera loop exits.
 
 ## 8. Runtime requirements and limitations
 
@@ -257,6 +290,8 @@ loop exits.
 - The MediaPipe model is a separate local file. The dataset is separate from
   the source code and is not recreated automatically when absent; train or
   supply samples before expecting known classifications.
+- Static-image mode still requires the MediaPipe model file, but does not
+  require a camera or a gesture dataset.
 - Cursor movement is smoothed and therefore intentionally trails the fingertip
   slightly. Increase `MOUSE_SMOOTHING_ALPHA` for less smoothing and faster
   response; decrease it for steadier but slower movement.

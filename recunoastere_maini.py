@@ -1,9 +1,12 @@
 import csv
 import math
+import os
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,7 +14,11 @@ import cv2
 import mediapipe as mp
 
 
+MOUSE_GESTURE_STABLE_SECONDS = 0.15
+MOUSE_CLICK_COOLDOWN_SECONDS = 0.8
+
 MODEL_PATH = Path(__file__).with_name("hand_landmarker.task")
+WINDOWS_MOUSE_BRIDGE_PATH = Path(__file__).with_name("windows_mouse_bridge.ps1")
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task"
@@ -30,6 +37,122 @@ FEATURE_COUNT = 21 * 3
 FEATURE_COLUMNS = [f"rotation_normalized_{index}" for index in range(FEATURE_COUNT)]
 CSV_COLUMNS = ["gesture", *FEATURE_COLUMNS]
 FeatureVector = list[float]
+
+
+@dataclass
+class ClickGestureState:
+    candidate: str | None = None
+    candidate_since: float = 0.0
+    stable_gesture: str | None = None
+    armed: bool = False
+    last_click: float = -math.inf
+
+
+@dataclass
+class MouseController:
+    backend: Any
+    screen_width: int
+    screen_height: int
+
+
+class WindowsMouseBridge:
+    def __init__(self) -> None:
+        if not os.environ.get("WSL_INTEROP"):
+            raise RuntimeError(
+                "The Windows mouse bridge can only be started from WSL with "
+                "Windows interop enabled."
+            )
+        if not WINDOWS_MOUSE_BRIDGE_PATH.is_file():
+            raise FileNotFoundError(
+                f"Windows mouse bridge not found: {WINDOWS_MOUSE_BRIDGE_PATH}"
+            )
+
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            raise RuntimeError(
+                "Could not find powershell.exe. Enable Windows interop in WSL "
+                "and ensure Windows paths are available on PATH."
+            )
+        script_path = subprocess.run(
+            ["wslpath", "-w", str(WINDOWS_MOUSE_BRIDGE_PATH)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.process = subprocess.Popen(
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        if self.process.stdout is None:
+            raise RuntimeError("Could not read the Windows mouse bridge response.")
+        ready = self.process.stdout.readline().strip().split("|")
+        if len(ready) != 3 or ready[0] != "READY":
+            self.close()
+            raise RuntimeError(
+                "Windows mouse bridge did not start correctly. "
+                f"Expected READY response, received: {'|'.join(ready)!r}"
+            )
+        try:
+            self.screen_width = int(ready[1])
+            self.screen_height = int(ready[2])
+        except ValueError as error:
+            self.close()
+            raise RuntimeError(
+                f"Windows mouse bridge returned invalid screen dimensions: {ready!r}"
+            ) from error
+        if self.screen_width <= 0 or self.screen_height <= 0:
+            self.close()
+            raise RuntimeError(
+                "Windows mouse bridge returned non-positive screen dimensions."
+            )
+
+    def _send(self, command: str) -> None:
+        if self.process.poll() is not None:
+            raise RuntimeError(
+                "Windows mouse bridge exited unexpectedly "
+                f"with code {self.process.returncode}."
+            )
+        if self.process.stdin is None:
+            raise RuntimeError("Windows mouse bridge input is unavailable.")
+        try:
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+        except OSError as error:
+            raise RuntimeError(
+                "Windows mouse bridge stopped accepting commands."
+            ) from error
+
+    def moveTo(self, x: int, y: int, duration: float = 0) -> None:
+        self._send(f"M {x} {y}")
+
+    def click(self) -> None:
+        self._send("C")
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            try:
+                if self.process.stdin is not None:
+                    self.process.stdin.write("Q\n")
+                    self.process.stdin.flush()
+                    self.process.stdin.close()
+                self.process.wait(timeout=2)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                self.process.terminate()
+                self.process.wait()
 
 
 class GestureClassifier:
@@ -187,6 +310,83 @@ def normalize_rotation(features: FeatureVector) -> FeatureVector:
     return normalized
 
 
+def create_mouse_controller() -> MouseController:
+    if os.environ.get("WSL_INTEROP"):
+        bridge = WindowsMouseBridge()
+        return MouseController(
+            bridge,
+            bridge.screen_width,
+            bridge.screen_height,
+        )
+
+    auth_path = os.environ.get("XAUTHORITY")
+    if not auth_path or not Path(auth_path).is_file():
+        default_auth_path = Path.home() / ".Xauthority"
+        if default_auth_path.is_file():
+            os.environ["XAUTHORITY"] = str(default_auth_path)
+        else:
+            os.environ["XAUTHORITY"] = os.devnull
+
+    try:
+        import pyautogui
+    except ImportError as error:
+        raise RuntimeError(
+            "Mouse mode needs PyAutoGUI. Install it in the active environment "
+            "with: python3 -m pip install pyautogui"
+        ) from error
+
+    pyautogui.PAUSE = 0
+    pyautogui.FAILSAFE = True
+    screen_width, screen_height = pyautogui.size()
+    return MouseController(pyautogui, screen_width, screen_height)
+
+
+def move_mouse_to_index(mouse: MouseController, landmarks: Sequence[Any]) -> None:
+    index_tip = landmarks[8]
+    screen_x = max(
+        1,
+        round(max(0.0, min(1.0, index_tip.x)) * (mouse.screen_width - 1)),
+    )
+    screen_y = max(
+        1,
+        round(max(0.0, min(1.0, index_tip.y)) * (mouse.screen_height - 1)),
+    )
+    mouse.backend.moveTo(screen_x, screen_y, duration=0)
+
+
+def update_click_gesture(
+    mouse: MouseController,
+    state: ClickGestureState,
+    gesture: str | None,
+    now: float,
+) -> None:
+    if gesture not in ("palm", "fist"):
+        state.candidate = None
+        state.stable_gesture = None
+        state.armed = False
+        return
+
+    if gesture != state.candidate:
+        state.candidate = gesture
+        state.candidate_since = now
+        return
+
+    if (
+        now - state.candidate_since < MOUSE_GESTURE_STABLE_SECONDS
+        or state.stable_gesture == gesture
+    ):
+        return
+
+    state.stable_gesture = gesture
+    if gesture == "palm":
+        state.armed = True
+    elif state.armed:
+        state.armed = False
+        if now - state.last_click >= MOUSE_CLICK_COOLDOWN_SECONDS:
+            mouse.backend.click()
+            state.last_click = now
+
+
 def rewrite_samples(features: Sequence[FeatureVector], labels: Sequence[str]) -> None:
     backup_path = DATASET_PATH.with_name("gesture_samples_before_rotation.csv")
     if not backup_path.exists():
@@ -289,11 +489,11 @@ def draw_hand_landmarks(
 def select_mode() -> str:
     while True:
         choice = input(
-            "Choose mode: [t]rain, [r]ecognize, or [c]orrect predictions: "
+            "Choose mode: [t]rain, [r]ecognize, [c]orrect, or [m]ouse: "
         ).strip().lower()
-        if choice in ("t", "r", "c"):
+        if choice in ("t", "r", "c", "m"):
             return choice
-        print("Please enter 't', 'r', or 'c'.")
+        print("Please enter 't', 'r', 'c', or 'm'.")
 
 
 def run_camera(
@@ -302,9 +502,13 @@ def run_camera(
     labels: list[str],
     classifier: GestureClassifier,
 ) -> None:
+    mouse = create_mouse_controller() if mode == "m" else None
+    click_state = ClickGestureState()
     camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if not camera.isOpened():
         camera.release()
+        if mouse is not None and hasattr(mouse.backend, "close"):
+            mouse.backend.close()
         raise RuntimeError("Could not open the camera. Check that it is connected.")
 
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -315,7 +519,12 @@ def run_camera(
         with create_hand_landmarker() as hands:
             last_timestamp_ms = -1
             last_capture_time = 0.0
-            if mode == "c":
+            if mode == "m":
+                status = (
+                    "Mouse: R index moves; L palm-to-fist clicks; "
+                    "press q or Esc to stop"
+                )
+            elif mode == "c":
                 status = "Correct: press f=fist, p=peace, i=index, a=palm"
             else:
                 status = "Show a hand; press f=fist, p=peace, i=index, a=palm"
@@ -333,10 +542,16 @@ def run_camera(
                 last_timestamp_ms = timestamp_ms
                 detected_hands = detect_hands(frame, hands, timestamp_ms)
                 draw_hand_landmarks(frame, detected_hands)
+                left_gesture: str | None = None
+                right_index_landmarks: Sequence[Any] | None = None
 
                 for hand_label, landmarks in detected_hands:
-                    if mode in ("r", "c"):
-                        label = "unknown"
+                    if mode in ("r", "c", "m"):
+                        label, neighbor_agreement, distance = (
+                            "unknown",
+                            0.0,
+                            math.inf,
+                        )
                         if classifier.features:
                             label, neighbor_agreement, distance = classifier.predict(
                                 extract_features(landmarks)
@@ -354,6 +569,12 @@ def run_camera(
                         else:
                             label_text = "unknown"
                         label_text = f"[{hand_label}] {label_text}"
+
+                        if mouse is not None:
+                            if hand_label == "R" and label == "index_point":
+                                right_index_landmarks = landmarks
+                            elif hand_label == "L":
+                                left_gesture = label
                     else:
                         label_text = f"[{hand_label}]"
 
@@ -370,6 +591,16 @@ def run_camera(
                         0.7,
                         (0, 255, 0),
                         2,
+                    )
+
+                if mouse is not None:
+                    if right_index_landmarks is not None:
+                        move_mouse_to_index(mouse, right_index_landmarks)
+                    update_click_gesture(
+                        mouse,
+                        click_state,
+                        left_gesture,
+                        time.monotonic(),
                     )
 
                 if mode in ("t", "c"):
@@ -429,6 +660,8 @@ def run_camera(
     finally:
         camera.release()
         cv2.destroyAllWindows()
+        if mouse is not None and hasattr(mouse.backend, "close"):
+            mouse.backend.close()
 
 
 def main() -> None:
@@ -436,15 +669,15 @@ def main() -> None:
     features, labels = load_samples()
     classifier = GestureClassifier()
 
-    if mode in ("r", "c"):
+    if mode in ("r", "c", "m"):
         if features:
             classifier.fit(features, labels)
             print(f"Loaded {len(labels)} training samples from {DATASET_PATH}.")
         else:
-            print(
-                "No training data found. Detected hands will be labeled unknown; "
-                "press a gesture key to add a correction sample."
-            )
+            message = "No training data found. Detected hands will be labeled unknown."
+            if mode == "c":
+                message += " Press a gesture key to add a correction sample."
+            print(message)
     if mode == "t":
         print(
             "Training mode: tap f for fist, p for peace, "
@@ -457,6 +690,11 @@ def main() -> None:
         print(
             "Correction mode: if a prediction is wrong, press the correct "
             "gesture key (f/p/i/a) to save that hand as a labeled sample."
+        )
+    elif mode == "m":
+        print(
+            "Mouse mode: right index-point moves the pointer; "
+            "left palm-to-fist clicks. Press q or Esc to stop."
         )
 
     run_camera(mode, features, labels, classifier)

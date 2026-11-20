@@ -9,7 +9,8 @@ training data.
 
 - Python 3.10 or later
 - A working webcam
-- Linux/WSL with GUI support for the OpenCV preview window
+- Linux with GUI support for the OpenCV preview window; WSL2 with WSLg is
+  supported when the webcam is attached to WSL
 
 Install Python dependencies in a virtual environment:
 
@@ -48,11 +49,26 @@ usbipd attach --wsl --busid <BUSID>
 If the device has not been shared before, run `usbipd bind --busid <BUSID>`
 from Administrator PowerShell first. Reattach it after shutting down WSL.
 
+## Platform support
+
+The script currently targets Linux/WSL: it opens the webcam with OpenCV's
+V4L2 backend. **Running it natively on Windows is not supported yet** because
+that camera backend is Linux-specific. To use it on a Windows computer, run it
+inside WSL2, attach the webcam to WSL, and use WSLg for the preview window.
+
+Mouse mode in WSL starts `windows_mouse_bridge.ps1` to move and click the
+Windows desktop cursor. It requires WSL Windows interop and `powershell.exe`
+on the WSL `PATH`. On a regular Linux desktop, mouse mode uses PyAutoGUI
+instead; install it with `python3 -m pip install pyautogui`.
+
 ## Run
 
 ```bash
 python3 recunoastere_maini.py
 ```
+
+Run this command from the project's Linux/WSL virtual environment, not from
+Windows PowerShell or Command Prompt.
 
 Choose a mode in the terminal:
 
@@ -60,6 +76,11 @@ Choose a mode in the terminal:
   point, or `a` for palm.
 - `r`: recognize gestures from saved samples.
 - `c`: correction mode. Press the correct gesture key to add a labeled sample.
+- `m`: mouse mode. A recognized right-hand index-point moves the pointer; a
+  left-hand palm-to-fist transition clicks once. In WSL, this mode starts
+  `windows_mouse_bridge.ps1` to control the Windows cursor. Keep the gesture
+  stable briefly to avoid accidental clicks; press `q` or Esc in the preview
+  to stop.
 
 Press `q` or Esc in the camera window to exit. Samples are stored in
 `gesture_samples.csv` beside the script. The dataset, migration backup, model,

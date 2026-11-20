@@ -1,0 +1,5 @@
+__pycache__/
+gesture_samples.csv
+gesture_samples_before_rotation.csv
+hand_landmarker.task
+recunoastere_maini.py.old
